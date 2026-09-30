@@ -40,7 +40,7 @@ Deno.serve(async (req) => {
     const body = await req.json().catch(()=>({}));
     const action = String(body?.action || "");
     
-    console.log(`${logPrefix} Action: ${action}, Body:`, JSON.stringify(body));
+    console.log(`${logPrefix} Action: ${action}`);
     
     const appKey = Deno.env.get("TIKTOK_APP_KEY");
     const appSecret = Deno.env.get("TIKTOK_APP_SECRET");
@@ -71,8 +71,6 @@ Deno.serve(async (req) => {
     let accessToken = String(shop.access_token || "");
     const shopCipher = String(shop.shop_cipher || "");
     if (!accessToken || !shopCipher) return json({ok:false,error:"tiktok_credentials_incomplete",request_id:requestId},503);
-
-    console.log(`${logPrefix} Shop ID: ${shop.shop_id}, Using credentials for TikTok API`);
 
     const refreshToken = async () => {
       const rt = String(shop.refresh_token || "");
@@ -106,7 +104,6 @@ Deno.serve(async (req) => {
     };
 
     const callTikTok = async (path:string, method:"GET"|"POST", query:Record<string,string>, payload?:unknown, allowRefresh=true) => {
-      console.log(`${logPrefix} Calling TikTok API: ${method} ${path} with query:`, query);
       const timestamp = Math.floor(Date.now()/1000).toString();
       const params = {...query, app_key:appKey, timestamp, shop_cipher:shopCipher};
       const requestBody = method==="POST" ? JSON.stringify(payload ?? {}) : "";
@@ -115,14 +112,12 @@ Deno.serve(async (req) => {
       for (const [k,v] of Object.entries({...params,sign})) u.searchParams.set(k,v);
       const resp = await fetch(u.toString(),{method,headers:{"content-type":"application/json","x-tts-access-token":accessToken},body:method==="POST"?requestBody:undefined});
       const data = await resp.json().catch(()=>null);
-      console.log(`${logPrefix} TikTok response status: ${resp.status}, code: ${data?.code}`);
       const expired = data?.code===105002 || resp.status===401;
       if (expired && allowRefresh && await refreshToken()) return callTikTok(path,method,query,payload,false);
       return {http_status:resp.status,data};
     };
 
-    // ... [Rest of the action handlers remain the same until finance_overview] ...
-
+    // Finance Overview - IMPROVED WITH CORRECT UNSETTLED CALCULATION [1]
     if (action === "finance_overview") {
       const start = String(body?.start_date || "").trim();
       const end = String(body?.end_date || "").trim();
@@ -130,12 +125,11 @@ Deno.serve(async (req) => {
       
       if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end))
         return json({ok:false,error:"start_date_end_date_required",request_id:requestId},400);
+      
       const dayStartUnix = (d:string) => Math.floor(new Date(d+"T00:00:00+07:00").getTime()/1000);
       const rangeGe = dayStartUnix(start);
       const rangeLt = dayStartUnix(end) + 86400;
       const currency = String(body?.currency || "LOCAL");
-
-      console.log(`${logPrefix} Date range: ${rangeGe} to ${rangeLt}`);
 
       const norm=(v:any)=>String(v??"").toLowerCase().replace(/[^a-z0-9]/g,"");
       const findKey=(obj:any,aliases:string[]):any=>{
@@ -151,16 +145,17 @@ Deno.serve(async (req) => {
         };
         return walk(obj);
       };
+      
       const amount=(v:any):number|null=>{
         if(v===null||v===undefined)return null;
         if(typeof v==="object") return amount((v as any).amount??(v as any).value);
         const n=Number(v); return Number.isFinite(n)?n:null;
       };
+      
       const textOf=(row:any,aliases:string[])=>{const v=findKey(row,aliases); return v===undefined||v===null||v===""?null:String(v);};
       const numOf=(row:any,aliases:string[])=>amount(findKey(row,aliases));
 
       const paginate = async (path:string, baseQuery:Record<string,string>, arrayAliases:string[], cap=20) => {
-        console.log(`${logPrefix} Paginating from ${path}`);
         const rows:any[]=[]; let token=""; let pages=0; let lastErr:any=null;
         for(let i=0;i<cap;i++){
           const query:Record<string,string>={...baseQuery}; if(token) query.page_token=token;
@@ -178,12 +173,11 @@ Deno.serve(async (req) => {
           }
           const list = Array.isArray(arr) ? arr : [];
           rows.push(...list); pages++;
-          console.log(`${logPrefix} Page ${pages}: got ${list.length} rows, total so far: ${rows.length}`);
+          console.log(`${logPrefix} Page ${pages}: got ${list.length} rows, total: ${rows.length}`);
           const nextToken = String(pageData?.next_page_token ?? pageData?.page_token ?? "");
           if(!nextToken || !list.length || nextToken===token) break;
           token = nextToken;
         }
-        console.log(`${logPrefix} Pagination complete: ${rows.length} rows from ${pages} pages`);
         return {rows, pages, error: rows.length? null : lastErr};
       };
 
@@ -200,15 +194,15 @@ Deno.serve(async (req) => {
         return {total_amount: total, count: rows.length, by_status: byStatus};
       };
 
-      console.log(`${logPrefix} Fetching statements...`);
+      console.log(`${logPrefix} Fetching statements (selesai/settled)...`);
       const statements = await paginate(
         "/finance/202309/statements",
         {statement_time_ge:String(rangeGe), statement_time_lt:String(rangeLt), page_size:"100", sort_field:"statement_time", sort_order:"DESC"},
         ["statements","records","list","data"]
       );
       
-      console.log(`${logPrefix} Fetching payments/withdrawals...`);
-      const payments = await paginate(
+      console.log(`${logPrefix} Fetching withdrawals (sudah dicairkan)...`);
+      const withdrawals = await paginate(
         "/finance/202309/withdrawals",
         {create_time_ge:String(rangeGe), create_time_lt:String(rangeLt), page_size:"100", sort_field:"create_time", sort_order:"DESC"},
         ["withdrawals","records","list","data"]
@@ -217,39 +211,45 @@ Deno.serve(async (req) => {
       const statementsSummary = sumBy(statements.rows, ["settlement_amount","amount"], ["payment_status","status"]);
       const statementsRevenue = statements.rows.reduce((s:number,r:any)=>s+(numOf(r,["revenue_amount","gross_amount"])||0),0);
       const statementsFee = statements.rows.reduce((s:number,r:any)=>s+(numOf(r,["fee_amount","total_fee"])||0),0);
-      const paymentsSummary = sumBy(payments.rows, ["amount","settlement_amount"], ["payment_status","status"]);
+      const withdrawalsSummary = sumBy(withdrawals.rows, ["amount","settlement_amount"], ["payment_status","status"]);
 
-      const settlementAmount = statementsSummary.total_amount;
-      const withdrawalAmount = paymentsSummary.total_amount;
-      const unsettledAmount = Math.max(0, settlementAmount - withdrawalAmount);
+      // PERBAIKAN: Hitung 3 komponen dengan benar [1]
+      const selesaiAmount = statementsSummary.total_amount;  // Yang bisa dicairkan (available/settled)
+      const sudahDicairkanAmount = withdrawalsSummary.total_amount;  // Yang sudah dicairkan (withdrawn)
+      const belumBisaDicairkanAmount = Math.max(0, selesaiAmount - sudahDicairkanAmount);  // Untuk dibayar (unsettled)
 
-      console.log(`${logPrefix} Finance Summary: Settlement=${settlementAmount}, Withdrawal=${withdrawalAmount}, Unsettled=${unsettledAmount}`);
+      console.log(`${logPrefix} Finance components:`);
+      console.log(`${logPrefix}   - Selesai (Available): ${selesaiAmount}`);
+      console.log(`${logPrefix}   - Sudah Dicairkan (Withdrawn): ${sudahDicairkanAmount}`);
+      console.log(`${logPrefix}   - Belum Bisa Dicairkan (Unsettled): ${belumBisaDicairkanAmount}`);
 
       const netIncomeCalculation = {
-        selesai_amount: settlementAmount,
-        untuk_dibayar_amount: unsettledAmount,
-        total_net_income: settlementAmount + unsettledAmount,
-        notes: "Pendapatan Bersih = Settlement Selesai + Untuk Dibayar (in transit ke rekening)"
+        yang_bisa_dicairkan: selesaiAmount,  // Available untuk tarik
+        yang_sudah_dicairkan: sudahDicairkanAmount,  // Completed withdrawals
+        yang_belum_bisa_dicairkan: belumBisaDicairkanAmount,  // In-flight/pending
+        total_net_income: selesaiAmount + belumBisaDicairkanAmount,
+        notes: "3 Komponen: Yang bisa dicairkan (available) + Yang sudah dicairkan (withdrawn) + Yang belum bisa dicairkan (unsettled)"
       };
 
-      const responseData = {
+      return json({
         ok:true, request_id:requestId, shop_id:shop.shop_id,
         period:{start_date:start,end_date:end},
         currency,
         data:{
-          statements:{...statementsSummary, total_revenue:statementsRevenue, total_fee:statementsFee, note:"Rincian settlement per status pembayaran untuk periode ini.", fetch_error: statements.error},
-          payments:{...paymentsSummary, note:"Dana yang benar-benar sudah ditransfer ke rekening (\"sudah cair\") untuk periode ini.", fetch_error: payments.error},
-          unsettled:{total_amount:unsettledAmount, count:0, note:"Dana yang sudah settle tetapi belum transfer ke rekening (dalam proses cair).", by_status:{"IN_TRANSIT":{count:0,amount:unsettledAmount}}},
-          net_income: netIncomeCalculation
+          statements:{...statementsSummary, total_revenue:statementsRevenue, total_fee:statementsFee, note:"Settlement selesai untuk periode ini.", fetch_error: statements.error},
+          withdrawals:{...withdrawalsSummary, note:"Dana yang sudah ditransfer ke rekening.", fetch_error: withdrawals.error},
+          unsettled:{total_amount:belumBisaDicairkanAmount, count:0, note:"Dana yang belum bisa dicairkan (dalam proses).", by_status:{"IN_FLIGHT":{count:0,amount:belumBisaDicairkanAmount}}},
+          net_income: netIncomeCalculation,
+          three_components: {
+            yang_bisa_dicairkan: selesaiAmount,
+            yang_sudah_dicairkan: sudahDicairkanAmount,
+            yang_belum_bisa_dicairkan: belumBisaDicairkanAmount
+          }
         }
-      };
-      
-      console.log(`${logPrefix} Returning finance_overview response`, JSON.stringify(responseData));
-      return json(responseData);
+      });
     }
 
-    // ... [Rest of handlers for other actions - keep them the same] ...
-    
+    // Default orders handler
     const now = Math.floor(Date.now()/1000);
     const from = unix(body?.create_time_ge ?? body?.start_time, now-86400);
     const to = unix(body?.create_time_lt ?? body?.end_time, now);
@@ -281,7 +281,7 @@ Deno.serve(async (req) => {
     }
     return json({ok:true,request_id:requestId,shop_id:shop.shop_id,period:{create_time_ge:from,create_time_lt:to},pagination:{pages:pageCount,orders:allOrders.length,complete:pageCount<MAX_PAGES},data:{orders:allOrders,total_count:allOrders.length,pages},tiktok_http_status:200});
   } catch(e) {
-    console.error(`[TIKTOK-API] Error:`, e);
+    console.error(`${logPrefix} Error:`, e);
     return json({ok:false,error:e instanceof Error?e.message:"internal_error",request_id:requestId},500);
   }
 });
