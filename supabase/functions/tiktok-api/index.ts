@@ -277,10 +277,6 @@ Deno.serve(async (req) => {
       const ctrRows=normalized.filter((x:any)=>Number.isFinite(x.ctr)).sort((a:any,b:any)=>b.ctr-a.ctr);
       const efficiencyRows=normalized.filter((x:any)=>Number.isFinite(x.gmv)&&Number.isFinite(x.views)&&x.views>0).map((x:any)=>({...x,gmv_per_1000_views:(x.gmv/x.views)*1000})).sort((a:any,b:any)=>b.gmv_per_1000_views-a.gmv_per_1000_views);
       const viewsNoGmvRows=normalized.filter((x:any)=>Number.isFinite(x.views)&&x.views>0&&(!Number.isFinite(x.gmv)||x.gmv<=0)).sort((a:any,b:any)=>b.views-a.views);
-      // TikTok's end_date_lt is EXCLUSIVE and must be strictly later than start_date_ge,
-      // so a valid one-day analytics request is [D, D+1). Only such a request is a valid
-      // daily snapshot. Multi-day/monthly analytics are aggregates and must never be stored
-      // under the first date, otherwise historical daily data becomes misleading.
       const nextDayOf=(d:string)=>new Date(Date.parse(d+"T00:00:00Z")+86400000).toISOString().slice(0,10);
       const isSingleDaySnapshot=end===nextDayOf(start);
       const performanceDate=start;
@@ -298,10 +294,7 @@ Deno.serve(async (req) => {
         ctr_rank:ctrRank.get(String(x.video_id))||null,
         high_views_low_gmv:Number.isFinite(x.views)&&x.views>0&&(!Number.isFinite(x.gmv)||x.gmv<=0),
         raw:x
-      })):[]; // Never persist multi-day/monthly aggregate analytics as daily rows.
-      // TikTok pagination can occasionally repeat a video record. PostgreSQL rejects
-      // multiple source rows targeting the same ON CONFLICT key in one INSERT.
-      // Deduplicate by (video_id, performance_date) before batching the upsert.
+      })):[]; 
       const persistenceMap=new Map<string,any>();
       for(const row of persistenceRows){
         const id=String(row?.video_id||"").trim();
@@ -331,8 +324,6 @@ Deno.serve(async (req) => {
         complete:!persistenceError,
         error:persistenceError
       };
-      // Persistence is a secondary snapshot. Do not make otherwise valid TikTok
-      // analytics unavailable just because the snapshot write failed.
       if(persistenceError) console.error("VIDEO_PERFORMANCE_PERSISTENCE_WARNING",JSON.stringify({request_id:requestId,persistence}));
 
       const summary={
@@ -397,7 +388,6 @@ Deno.serve(async (req) => {
       const textOf=(row:any,aliases:string[])=>{const v=findKey(row,aliases); return v===undefined||v===null||v===""?null:String(v);};
       const numOf=(row:any,aliases:string[])=>amount(findKey(row,aliases));
 
-      // Generic pager for finance list endpoints.
       const paginate = async (path:string, baseQuery:Record<string,string>, arrayAliases:string[], cap=20) => {
         const rows:any[]=[]; let token=""; let pages=0; let lastErr:any=null;
         for(let i=0;i<cap;i++){
@@ -436,33 +426,29 @@ Deno.serve(async (req) => {
         return {total_amount: total, count: rows.length, by_status: byStatus};
       };
 
-      // 1) Statement settlement dalam rentang tanggal - SELESAI (sudah settled)
+      const unsettled = { rows: [] as any[], pages: 0, error: { reason: "endpoint_not_available", note: "TikTok tidak menyediakan endpoint unsettled-transactions yang valid untuk akun ini." } };
       const statements = await paginate(
         "/finance/202309/statements",
         {statement_time_ge:String(rangeGe), statement_time_lt:String(rangeLt), page_size:"100", sort_field:"statement_time", sort_order:"DESC"},
         ["statements","records","list","data"]
       );
-
-      // 2) Dana yang sudah ditransfer ke rekening bank ("sudah cair" / Penarikan Dana)
       const payments = await paginate(
         "/finance/202309/withdrawals",
         {create_time_ge:String(rangeGe), create_time_lt:String(rangeLt), page_size:"100", sort_field:"create_time", sort_order:"DESC"},
         ["withdrawals","records","list","data"]
       );
 
-      // 3) UNTUK DIBAYAR (Unsettled) = Settlement sudah selesai TETAPI belum ditransfer ke rekening
-      // Logic: Ambil semua settlement yang sudah finalized, tapi tidak ada record di withdrawals untuk order tersebut
-      // Ini adalah dana yang sudah siap/dalam proses tapi belum cair ke rekening
-      const settlementAmount = statements.rows.reduce((s:number,r:any)=>s+(numOf(r,["settlement_amount","amount"])||0),0);
-      const withdrawalAmount = payments.rows.reduce((s:number,r:any)=>s+(numOf(r,["amount","settlement_amount"])||0),0);
-      const unsettledAmount = Math.max(0, settlementAmount - withdrawalAmount);
-
+      const unsettledSummary = { ...sumBy(unsettled.rows, ["est_settlement_amount","settlement_amount","revenue_amount","amount"], ["settlement_status","status"]), data_unavailable: true };
       const statementsSummary = sumBy(statements.rows, ["settlement_amount","amount"], ["payment_status","status"]);
       const statementsRevenue = statements.rows.reduce((s:number,r:any)=>s+(numOf(r,["revenue_amount","gross_amount"])||0),0);
       const statementsFee = statements.rows.reduce((s:number,r:any)=>s+(numOf(r,["fee_amount","total_fee"])||0),0);
       const paymentsSummary = sumBy(payments.rows, ["amount","settlement_amount"], ["payment_status","status"]);
 
-      // PERBAIKAN: Definisi Pendapatan Bersih = Selesai + Untuk Dibayar
+      // PERBAIKAN: Hitung unsettled yang benar [1]
+      const settlementAmount = statementsSummary.total_amount;
+      const withdrawalAmount = paymentsSummary.total_amount;
+      const unsettledAmount = Math.max(0, settlementAmount - withdrawalAmount);
+
       const netIncomeCalculation = {
         selesai_amount: settlementAmount,
         untuk_dibayar_amount: unsettledAmount,
