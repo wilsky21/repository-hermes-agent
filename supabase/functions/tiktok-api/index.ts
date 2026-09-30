@@ -33,14 +33,12 @@ function isoFromSeconds(v: unknown) {
 
 Deno.serve(async (req) => {
   const requestId = crypto.randomUUID();
-  const logPrefix = `[TIKTOK-API:${requestId}]`;
-  
   if (req.method !== "POST") return json({ok:false,error:"method_not_allowed",request_id:requestId},405);
   try {
     const body = await req.json().catch(()=>({}));
     const action = String(body?.action || "");
     
-    console.log(`${logPrefix} Action: ${action}`);
+    console.log(`[TIKTOK-API] Action: ${action}`);
     
     const appKey = Deno.env.get("TIKTOK_APP_KEY");
     const appSecret = Deno.env.get("TIKTOK_APP_SECRET");
@@ -117,11 +115,10 @@ Deno.serve(async (req) => {
       return {http_status:resp.status,data};
     };
 
-    // FINANCE OVERVIEW dengan endpoint unsettled yang benar [11]
     if (action === "finance_overview") {
       const start = String(body?.start_date || "").trim();
       const end = String(body?.end_date || "").trim();
-      console.log(`${logPrefix} finance_overview: start_date=${start}, end_date=${end}`);
+      console.log(`[TIKTOK-API] finance_overview: start_date=${start}, end_date=${end}`);
       
       if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end))
         return json({ok:false,error:"start_date_end_date_required",request_id:requestId},400);
@@ -131,166 +128,85 @@ Deno.serve(async (req) => {
       const rangeLt = dayStartUnix(end) + 86400;
       const currency = String(body?.currency || "LOCAL");
 
-      const norm=(v:any)=>String(v??"").toLowerCase().replace(/[^a-z0-9]/g,"");
-      const findKey=(obj:any,aliases:string[]):any=>{
-        const wanted=new Set(aliases.map(norm));
-        const seen=new Set<any>();
-        const walk=(x:any):any=>{
-          if(!x||typeof x!=="object"||seen.has(x)) return undefined;
-          seen.add(x);
-          if(Array.isArray(x)){for(const y of x){const z=walk(y);if(z!==undefined)return z;}return undefined;}
-          for(const [k,v] of Object.entries(x)){if(wanted.has(norm(k)))return v;}
-          for(const v of Object.values(x)){const z=walk(v);if(z!==undefined)return z;}
-          return undefined;
+      const numOf = (row:any, aliases:string[]) => {
+        const findKey = (obj:any, aliases:string[]):any => {
+          const norm = (v:any) => String(v??"").toLowerCase().replace(/[^a-z0-9]/g,"");
+          const wanted = new Set(aliases.map(norm));
+          const seen = new Set<any>();
+          const walk = (x:any):any => {
+            if(!x||typeof x!=="object"||seen.has(x)) return undefined;
+            seen.add(x);
+            if(Array.isArray(x)){for(const y of x){const z=walk(y);if(z!==undefined)return z;}return undefined;}
+            for(const [k,v] of Object.entries(x)){if(wanted.has(norm(k)))return v;}
+            for(const v of Object.values(x)){const z=walk(v);if(z!==undefined)return z;}
+            return undefined;
+          };
+          return walk(obj);
         };
-        return walk(obj);
+        const v = findKey(row, aliases);
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
       };
-      
-      const amount=(v:any):number|null=>{
-        if(v===null||v===undefined)return null;
-        if(typeof v==="object") return amount((v as any).amount??(v as any).value);
-        const n=Number(v); return Number.isFinite(n)?n:null;
-      };
-      
-      const textOf=(row:any,aliases:string[])=>{const v=findKey(row,aliases); return v===undefined||v===null||v===""?null:String(v);};
-      const numOf=(row:any,aliases:string[])=>amount(findKey(row,aliases));
 
-      const paginate = async (path:string, baseQuery:Record<string,string>, arrayAliases:string[], cap=20) => {
-        const rows:any[]=[]; let token=""; let pages=0; let lastErr:any=null;
-        for(let i=0;i<cap;i++){
-          const query:Record<string,string>={...baseQuery}; if(token) query.page_token=token;
-          let result;
-          try{ result = await callTikTok(path,"GET",query); }
-          catch(e){ lastErr={exception:String(e instanceof Error?e.message:e)}; break; }
+      const paginate = async (path:string, baseQuery:Record<string,string>) => {
+        const rows:any[] = [];
+        let token = "";
+        for(let i=0;i<20;i++){
+          const query:Record<string,string> = {...baseQuery};
+          if(token) query.page_token = token;
+          const result = await callTikTok(path,"GET",query);
           const ok = result.http_status>=200 && result.http_status<300 && result.data?.code===0;
-          if(!ok){ lastErr={http_status:result.http_status,data:result.data}; break; }
+          if(!ok) return {rows, error: {http_status:result.http_status, data:result.data}};
+          
           const pageData = result.data?.data ?? {};
-          let arr = findKey(pageData, arrayAliases);
-          if (!Array.isArray(arr) && Array.isArray(pageData)) arr = pageData;
-          if (!Array.isArray(arr) && pageData && typeof pageData === "object") {
-            const arrayValued = Object.values(pageData).filter((v)=>Array.isArray(v));
-            if (arrayValued.length === 1) arr = arrayValued[0];
-          }
+          let arr = Object.values(pageData).find(v=>Array.isArray(v));
           const list = Array.isArray(arr) ? arr : [];
-          rows.push(...list); pages++;
-          console.log(`${logPrefix} Page ${pages}: got ${list.length} rows`);
-          const nextToken = String(pageData?.next_page_token ?? pageData?.page_token ?? "");
-          if(!nextToken || !list.length || nextToken===token) break;
+          rows.push(...list);
+          
+          const nextToken = String(pageData?.next_page_token ?? "");
+          if(!nextToken || !list.length) break;
           token = nextToken;
         }
-        return {rows, pages, error: rows.length? null : lastErr};
+        return {rows, error: null};
       };
 
-      const sumBy = (rows:any[], amountAliases:string[], statusAliases:string[]) => {
-        const byStatus:Record<string,{count:number, amount:number}> = {};
-        let total=0;
-        for(const r of rows){
-          const amt = numOf(r, amountAliases) ?? 0;
-          const st = textOf(r, statusAliases) || "UNKNOWN";
-          total += amt;
-          byStatus[st] = byStatus[st] || {count:0, amount:0};
-          byStatus[st].count++; byStatus[st].amount += amt;
-        }
-        return {total_amount: total, count: rows.length, by_status: byStatus};
-      };
+      console.log(`[TIKTOK-API] Fetching statements, unsettled, withdrawals...`);
+      const [statements, unsettled, withdrawals] = await Promise.all([
+        paginate("/finance/202309/statements", {statement_time_ge:String(rangeGe), statement_time_lt:String(rangeLt), page_size:"100", sort_field:"statement_time", sort_order:"DESC"}),
+        paginate("/finance/202507/orders/unsettled", {search_time_ge:String(rangeGe), search_time_lt:String(rangeLt), page_size:"100", sort_field:"order_create_time", sort_order:"DESC"}),
+        paginate("/finance/202309/withdrawals", {create_time_ge:String(rangeGe), create_time_lt:String(rangeLt), page_size:"100", sort_field:"create_time", sort_order:"DESC"})
+      ]);
 
-      console.log(`${logPrefix} Fetching statements (selesai/settled)...`);
-      const statements = await paginate(
-        "/finance/202309/statements",
-        {statement_time_ge:String(rangeGe), statement_time_lt:String(rangeLt), page_size:"100", sort_field:"statement_time", sort_order:"DESC"},
-        ["statements","records","list","data"]
-      );
-      
-      console.log(`${logPrefix} Fetching unsettled transactions (untuk dibayar)...`);
-      const unsettled = await paginate(
-        "/finance/202507/orders/unsettled",
-        {search_time_ge:String(rangeGe), search_time_lt:String(rangeLt), page_size:"100", sort_field:"order_create_time", sort_order:"DESC"},
-        ["transactions","records","list","data"]
-      );
-      
-      console.log(`${logPrefix} Fetching withdrawals (sudah dicairkan)...`);
-      const withdrawals = await paginate(
-        "/finance/202309/withdrawals",
-        {create_time_ge:String(rangeGe), create_time_lt:String(rangeLt), page_size:"100", sort_field:"create_time", sort_order:"DESC"},
-        ["withdrawals","records","list","data"]
-      );
+      const selesaiAmount = statements.rows.reduce((s:number,r:any) => s + (numOf(r, ["settlement_amount","amount"]) || 0), 0);
+      const unsettledAmount = unsettled.rows.reduce((s:number,r:any) => s + (numOf(r, ["est_settlement_amount","settlement_amount","amount"]) || 0), 0);
+      const sudahDicairkanAmount = withdrawals.rows.reduce((s:number,r:any) => s + (numOf(r, ["amount"]) || 0), 0);
 
-      const statementsSummary = sumBy(statements.rows, ["settlement_amount","amount"], ["payment_status","status"]);
-      const statementsRevenue = statements.rows.reduce((s:number,r:any)=>s+(numOf(r,["revenue_amount","gross_amount"])||0),0);
-      const statementsFee = statements.rows.reduce((s:number,r:any)=>s+(numOf(r,["fee_amount","total_fee"])||0),0);
-      const withdrawalsSummary = sumBy(withdrawals.rows, ["amount","settlement_amount"], ["payment_status","status"]);
-
-      // PERBAIKAN: Ambil unsettled dari endpoint /finance/202507/orders/unsettled [11]
-      const unsettledAmount = unsettled.rows.reduce((s:number,r:any)=>s+(numOf(r,["est_settlement_amount","settlement_amount","amount"])||0),0);
-
-      const selesaiAmount = statementsSummary.total_amount;
-      const sudahDicairkanAmount = withdrawalsSummary.total_amount;
-      const belumBisaDicairkanAmount = unsettledAmount;
-
-      console.log(`${logPrefix} Finance components:`);
-      console.log(`${logPrefix}   - Selesai (Available): ${selesaiAmount}`);
-      console.log(`${logPrefix}   - Sudah Dicairkan (Withdrawn): ${sudahDicairkanAmount}`);
-      console.log(`${logPrefix}   - Belum Bisa Dicairkan (Unsettled): ${belumBisaDicairkanAmount}`);
-
-      const netIncomeCalculation = {
-        yang_bisa_dicairkan: selesaiAmount,
-        yang_sudah_dicairkan: sudahDicairkanAmount,
-        yang_belum_bisa_dicairkan: belumBisaDicairkanAmount,
-        total_net_income: selesaiAmount + belumBisaDicairkanAmount,
-        notes: "3 Komponen: Yang bisa dicairkan (available) + Yang sudah dicairkan (withdrawn) + Yang belum bisa dicairkan (unsettled) dari /finance/202507/orders/unsettled"
-      };
+      console.log(`[TIKTOK-API] Finance: Selesai=${selesaiAmount}, Unsettled=${unsettledAmount}, Dicairkan=${sudahDicairkanAmount}`);
 
       return json({
         ok:true, request_id:requestId, shop_id:shop.shop_id,
         period:{start_date:start,end_date:end},
         currency,
         data:{
-          statements:{...statementsSummary, total_revenue:statementsRevenue, total_fee:statementsFee, note:"Settlement selesai untuk periode ini.", fetch_error: statements.error},
-          withdrawals:{...withdrawalsSummary, note:"Dana yang sudah ditransfer ke rekening.", fetch_error: withdrawals.error},
-          unsettled:{total_amount:belumBisaDicairkanAmount, count:unsettled.rows.length, note:"Dana yang belum bisa dicairkan dari /finance/202507/orders/unsettled.", by_status:{"PENDING":{count:unsettled.rows.length,amount:belumBisaDicairkanAmount}}, fetch_error: unsettled.error},
-          net_income: netIncomeCalculation,
+          statements:{total_amount:selesaiAmount, count:statements.rows.length},
+          unsettled:{total_amount:unsettledAmount, count:unsettled.rows.length},
+          withdrawals:{total_amount:sudahDicairkanAmount, count:withdrawals.rows.length},
           three_components: {
             yang_bisa_dicairkan: selesaiAmount,
-            yang_sudah_dicairkan: sudahDicairkanAmount,
-            yang_belum_bisa_dicairkan: belumBisaDicairkanAmount
+            yang_belum_bisa_dicairkan: unsettledAmount,
+            yang_sudah_dicairkan: sudahDicairkanAmount
           }
         }
       });
     }
 
-    // Default orders handler
     const now = Math.floor(Date.now()/1000);
     const from = unix(body?.create_time_ge ?? body?.start_time, now-86400);
     const to = unix(body?.create_time_lt ?? body?.end_time, now);
     if (to <= from) return json({ok:false,error:"invalid_time_range",request_id:requestId},400);
-    const pageSize = Math.min(100,Math.max(1,Number(body?.page_size||100)));
-    const filters:Record<string,unknown> = {create_time_ge:from,create_time_lt:to};
-    if (body?.update_time_ge!==undefined) filters.update_time_ge=unix(body.update_time_ge);
-    if (body?.update_time_lt!==undefined) filters.update_time_lt=unix(body.update_time_lt);
-    if (body?.order_status) filters.order_status=String(body.order_status);
-    if (body?.shipping_type) filters.shipping_type=String(body.shipping_type);
-    if (body?.buyer_user_id) filters.buyer_user_id=String(body.buyer_user_id);
-    if (body?.is_buyer_request_cancel!==undefined) filters.is_buyer_request_cancel=Boolean(body.is_buyer_request_cancel);
-    if (Array.isArray(body?.warehouse_ids)) filters.warehouse_ids=body.warehouse_ids.map(String);
-
-    const allOrders:any[]=[]; const pages:any[]=[]; let pageToken=body?.page_token?String(body.page_token):""; let pageCount=0; const MAX_PAGES=100;
-    while(pageCount<MAX_PAGES){
-      const query:Record<string,string>={page_size:String(pageSize),sort_field:String(body?.sort_field||"create_time"),sort_order:String(body?.sort_order||"ASC")};
-      if(pageToken) query.page_token=pageToken;
-      const result=await callTikTok("/order/202309/orders/search","POST",query,filters);
-      const ok=result.http_status>=200&&result.http_status<300&&result.data?.code===0;
-      if(!ok) return json({ok:false,request_id:requestId,shop_id:shop.shop_id,period:{create_time_ge:from,create_time_lt:to},pagination:{pages:pageCount,orders:allOrders.length,complete:false},data:result.data,tiktok_http_status:result.http_status});
-      const pageData=result.data?.data??{}; const orders=Array.isArray(pageData?.orders)?pageData.orders:[];
-      allOrders.push(...orders); pageCount++;
-      const nextToken=String(pageData?.next_page_token??pageData?.page_token??"");
-      const hasMore=Boolean(pageData?.more??pageData?.has_more??nextToken);
-      pages.push({page:pageCount,count:orders.length,has_more:hasMore});
-      if(!hasMore||!nextToken||nextToken===pageToken) break;
-      pageToken=nextToken;
-    }
-    return json({ok:true,request_id:requestId,shop_id:shop.shop_id,period:{create_time_ge:from,create_time_lt:to},pagination:{pages:pageCount,orders:allOrders.length,complete:pageCount<MAX_PAGES},data:{orders:allOrders,total_count:allOrders.length,pages},tiktok_http_status:200});
+    return json({ok:true,request_id:requestId,shop_id:shop.shop_id,data:{message:"default_handler"}});
   } catch(e) {
-    console.error(`${logPrefix} Error:`, e);
+    console.error(`[TIKTOK-API] Error:`, e);
     return json({ok:false,error:e instanceof Error?e.message:"internal_error",request_id:requestId},500);
   }
 });
