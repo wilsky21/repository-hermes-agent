@@ -117,7 +117,7 @@ Deno.serve(async (req) => {
       return {http_status:resp.status,data};
     };
 
-    // Finance Overview - IMPROVED WITH CORRECT UNSETTLED CALCULATION [1]
+    // FINANCE OVERVIEW dengan endpoint unsettled yang benar [11]
     if (action === "finance_overview") {
       const start = String(body?.start_date || "").trim();
       const end = String(body?.end_date || "").trim();
@@ -173,7 +173,7 @@ Deno.serve(async (req) => {
           }
           const list = Array.isArray(arr) ? arr : [];
           rows.push(...list); pages++;
-          console.log(`${logPrefix} Page ${pages}: got ${list.length} rows, total: ${rows.length}`);
+          console.log(`${logPrefix} Page ${pages}: got ${list.length} rows`);
           const nextToken = String(pageData?.next_page_token ?? pageData?.page_token ?? "");
           if(!nextToken || !list.length || nextToken===token) break;
           token = nextToken;
@@ -201,6 +201,13 @@ Deno.serve(async (req) => {
         ["statements","records","list","data"]
       );
       
+      console.log(`${logPrefix} Fetching unsettled transactions (untuk dibayar)...`);
+      const unsettled = await paginate(
+        "/finance/202507/orders/unsettled",
+        {search_time_ge:String(rangeGe), search_time_lt:String(rangeLt), page_size:"100", sort_field:"order_create_time", sort_order:"DESC"},
+        ["transactions","records","list","data"]
+      );
+      
       console.log(`${logPrefix} Fetching withdrawals (sudah dicairkan)...`);
       const withdrawals = await paginate(
         "/finance/202309/withdrawals",
@@ -213,10 +220,12 @@ Deno.serve(async (req) => {
       const statementsFee = statements.rows.reduce((s:number,r:any)=>s+(numOf(r,["fee_amount","total_fee"])||0),0);
       const withdrawalsSummary = sumBy(withdrawals.rows, ["amount","settlement_amount"], ["payment_status","status"]);
 
-      // PERBAIKAN: Hitung 3 komponen dengan benar [1]
-      const selesaiAmount = statementsSummary.total_amount;  // Yang bisa dicairkan (available/settled)
-      const sudahDicairkanAmount = withdrawalsSummary.total_amount;  // Yang sudah dicairkan (withdrawn)
-      const belumBisaDicairkanAmount = Math.max(0, selesaiAmount - sudahDicairkanAmount);  // Untuk dibayar (unsettled)
+      // PERBAIKAN: Ambil unsettled dari endpoint /finance/202507/orders/unsettled [11]
+      const unsettledAmount = unsettled.rows.reduce((s:number,r:any)=>s+(numOf(r,["est_settlement_amount","settlement_amount","amount"])||0),0);
+
+      const selesaiAmount = statementsSummary.total_amount;
+      const sudahDicairkanAmount = withdrawalsSummary.total_amount;
+      const belumBisaDicairkanAmount = unsettledAmount;
 
       console.log(`${logPrefix} Finance components:`);
       console.log(`${logPrefix}   - Selesai (Available): ${selesaiAmount}`);
@@ -224,11 +233,11 @@ Deno.serve(async (req) => {
       console.log(`${logPrefix}   - Belum Bisa Dicairkan (Unsettled): ${belumBisaDicairkanAmount}`);
 
       const netIncomeCalculation = {
-        yang_bisa_dicairkan: selesaiAmount,  // Available untuk tarik
-        yang_sudah_dicairkan: sudahDicairkanAmount,  // Completed withdrawals
-        yang_belum_bisa_dicairkan: belumBisaDicairkanAmount,  // In-flight/pending
+        yang_bisa_dicairkan: selesaiAmount,
+        yang_sudah_dicairkan: sudahDicairkanAmount,
+        yang_belum_bisa_dicairkan: belumBisaDicairkanAmount,
         total_net_income: selesaiAmount + belumBisaDicairkanAmount,
-        notes: "3 Komponen: Yang bisa dicairkan (available) + Yang sudah dicairkan (withdrawn) + Yang belum bisa dicairkan (unsettled)"
+        notes: "3 Komponen: Yang bisa dicairkan (available) + Yang sudah dicairkan (withdrawn) + Yang belum bisa dicairkan (unsettled) dari /finance/202507/orders/unsettled"
       };
 
       return json({
@@ -238,7 +247,7 @@ Deno.serve(async (req) => {
         data:{
           statements:{...statementsSummary, total_revenue:statementsRevenue, total_fee:statementsFee, note:"Settlement selesai untuk periode ini.", fetch_error: statements.error},
           withdrawals:{...withdrawalsSummary, note:"Dana yang sudah ditransfer ke rekening.", fetch_error: withdrawals.error},
-          unsettled:{total_amount:belumBisaDicairkanAmount, count:0, note:"Dana yang belum bisa dicairkan (dalam proses).", by_status:{"IN_FLIGHT":{count:0,amount:belumBisaDicairkanAmount}}},
+          unsettled:{total_amount:belumBisaDicairkanAmount, count:unsettled.rows.length, note:"Dana yang belum bisa dicairkan dari /finance/202507/orders/unsettled.", by_status:{"PENDING":{count:unsettled.rows.length,amount:belumBisaDicairkanAmount}}, fetch_error: unsettled.error},
           net_income: netIncomeCalculation,
           three_components: {
             yang_bisa_dicairkan: selesaiAmount,
