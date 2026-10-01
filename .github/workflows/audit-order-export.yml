@@ -1,0 +1,52 @@
+name: audit-order-export
+on:
+  push:
+    branches: ["audit/export-18sep"]
+permissions:
+  contents: write
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install openpyxl
+      - name: Parse export
+        run: |
+          python - <<'PY'
+          import openpyxl, json, collections
+          p="Semua pesanan-2026-10-01-13_01.xlsx"
+          wb=openpyxl.load_workbook(p, read_only=True, data_only=True)
+          ws=wb[wb.sheetnames[0]]
+          rows=ws.iter_rows(values_only=True)
+          header=next(rows)
+          idx={str(v).strip():i for i,v in enumerate(header) if v is not None}
+          ids=[]; records=[]
+          for row in rows:
+              oid=row[idx.get("Order ID")] if "Order ID" in idx else None
+              if oid is None: continue
+              oid=str(oid).strip()
+              rec={"id":oid,
+                   "status":str(row[idx["Order Status"]]).strip() if "Order Status" in idx and row[idx["Order Status"]] is not None else "",
+                   "purchase":str(row[idx["Purchase Channel"]]).strip() if "Purchase Channel" in idx and row[idx["Purchase Channel"]] is not None else "",
+                   "created":str(row[idx["Created Time"]]).strip() if "Created Time" in idx and row[idx["Created Time"]] is not None else ""}
+              records.append(rec); ids.append(oid)
+          unique=list(dict.fromkeys(ids))
+          by_purchase={}
+          for r in records:
+              by_purchase.setdefault(r["purchase"],set()).add(r["id"])
+          by_status=collections.Counter(r["status"] for r in records)
+          out={"sheetnames":wb.sheetnames,"data_rows":len(records),"unique_orders":len(unique),"duplicate_rows":len(records)-len(unique),
+               "unique_by_purchase":{k:len(v) for k,v in by_purchase.items()},"rows_by_status":dict(by_status),
+               "orders":records}
+          open("audit_order_export.json","w",encoding="utf-8").write(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - name: Commit audit result
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add audit_order_export.json
+          git commit -m "audit: parse 18 Sep order export" || exit 0
+          git push
