@@ -1,0 +1,11 @@
+{
+  "sheetnames": [
+    "OrderSKUList"
+  ],
+  "data_rows": 0,
+  "unique_orders": 0,
+  "duplicate_rows": 0,
+  "unique_by_purchase": {},
+  "rows_by_status": {},
+  "orders": []
+}
